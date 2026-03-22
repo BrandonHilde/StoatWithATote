@@ -1,0 +1,6 @@
+node_modules/
+.stoat-backups/
+.stoat/
+publish/
+bin/
+obj/
