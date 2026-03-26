@@ -47,23 +47,73 @@ else
     Console.WriteLine(Ansi.Green($"\n  ✓ Using model: {Config.Model}\n"));
 }
 
+// Personality selection
+var personalities = StoatPersonalityManager.GetPersonalityNames();
+
+Console.WriteLine(Ansi.Bold("  🎭 Available personalities:"));
+for (int i = 0; i < personalities.Count; i++)
+{
+    var pName = personalities[i];
+    var personality = StoatPersonalityManager.GetPersonality(pName);
+    var marker = pName == Config.DefaultPersonality ? Ansi.Green("►") : " ";
+    Console.WriteLine($"    {marker} [{i + 1}] {pName,-12} {Ansi.Dim(personality.Description)}");
+}
+
+Console.Write(Ansi.Cyan("\n  Select a personality ") + Ansi.Dim($"[1-{personalities.Count}, Enter = {Config.DefaultPersonality}] ") + "> ");
+var personalityPick = Console.ReadLine()?.Trim() ?? "";
+
+if (!string.IsNullOrEmpty(personalityPick) && int.TryParse(personalityPick, out var pIdx) && pIdx >= 1 && pIdx <= personalities.Count)
+    Config.DefaultPersonality = personalities[pIdx - 1];
+
+Config.CurrentPersonality = StoatPersonalityManager.GetPersonality(Config.DefaultPersonality);
+Console.WriteLine(Ansi.Green($"\n  ✓ Using personality: {Config.DefaultPersonality}\n"));
+
+// Mode selection
+Console.WriteLine(Ansi.Bold("  🎯 Select Mode:"));
+Console.WriteLine("    [1] Code Mode  " + Ansi.Dim("- Analyze files, generate code changes"));
+Console.WriteLine("    [2] Chat Mode  " + Ansi.Dim("- Conversational assistance (type 'code' or 'chat' to switch)"));
+Console.Write(Ansi.Cyan("\n  Choose mode ") + Ansi.Dim("[1/2, Enter = 1] ") + "> ");
+var modePick = Console.ReadLine()?.Trim() ?? "1";
+
+if (modePick == "2")
+    Config.CurrentMode = CliMode.Chat;
+else
+    Config.CurrentMode = CliMode.Code;
+
+Console.WriteLine(Ansi.Green($"\n  ✓ Starting in {Config.CurrentMode} Mode\n"));
+Console.WriteLine(Ansi.Dim("  Type 'help' for commands, 'code' or 'chat' to switch modes.\n"));
+
+var chatHistory = new List<(string role, string content)>();
+
 // Main loop
 while (true)
 {
-    Console.Write(Ansi.Cyan("\n🐾 What do you need? ") + Ansi.Dim("(quit to exit)\n> "));
-    var task = Console.ReadLine();
+    var modeIndicator = Config.CurrentMode == CliMode.Chat
+        ? Ansi.Magenta("[CHAT] ")
+        : Ansi.Green("[CODE] ");
 
-    if (string.IsNullOrWhiteSpace(task) ||
-        task.Trim().Equals("quit", StringComparison.OrdinalIgnoreCase) ||
-        task.Trim().Equals("exit", StringComparison.OrdinalIgnoreCase))
+    Console.Write(Ansi.Cyan($"\n{modeIndicator}What do you need? ") + Ansi.Dim("(type 'help' for commands)\n> "));
+
+    var input = Console.ReadLine() ?? "";
+
+    var commandResult = HandleModeCommand(input, chatHistory);
+    if (commandResult.shouldExit)
     {
         Console.WriteLine(Ansi.Yellow("\n  Stoat scurries away! 🐾\n"));
         break;
     }
+    if (commandResult.switchedMode || commandResult.wasHelp)
+        continue;
+
+    if (string.IsNullOrWhiteSpace(input))
+        continue;
 
     try
     {
-        await RunTaskAsync(task);
+        if (Config.CurrentMode == CliMode.Chat)
+            await RunChatModeAsync(input, chatHistory);
+        else
+            await RunCodeModeAsync(input, chatHistory);
     }
     catch (Exception ex)
     {
@@ -72,104 +122,190 @@ while (true)
     }
 }
 
-async Task RunTaskAsync(string task)
-{
-    var cwd = Directory.GetCurrentDirectory();
-    var filesToSend = new List<string>();
-    var toolResults = new List<ToolResult>();
-    var readContents = new Dictionary<string, string>();
+// === Helper Methods ===
 
-    // Start conversation logging
+(bool shouldExit, bool switchedMode, bool wasHelp) HandleModeCommand(string input, List<(string role, string content)> history)
+{
+    var trimmed = input.Trim().ToLowerInvariant();
+
+    if (trimmed is "quit" or "exit" or "q")
+        return (true, false, false);
+
+    if (trimmed is "help" or "?")
+    {
+        Console.WriteLine(Ansi.Bold("\n  📋 Available Commands:"));
+        Console.WriteLine("    help, ?        " + Ansi.Dim("- Show this help message"));
+        Console.WriteLine("    quit, exit, q  " + Ansi.Dim("- Exit the application"));
+        Console.WriteLine("    code           " + Ansi.Dim("- Switch to Code Mode"));
+        Console.WriteLine("    chat           " + Ansi.Dim("- Switch to Chat Mode"));
+        Console.WriteLine("    export         " + Ansi.Dim("- Export conversation as markdown file"));
+        Console.WriteLine(Ansi.Dim("  (Or type your message to continue in current mode)\n"));
+        return (false, false, true);
+    }
+
+    if (trimmed == "export")
+    {
+        ExportConversationAsMarkdown(history);
+        return (false, false, true);
+    }
+
+    bool isCodeCommand = trimmed is "mode code" or "code" or "/code";
+    bool isChatCommand = trimmed is "mode chat" or "chat" or "/chat";
+
+    if (isCodeCommand && Config.CurrentMode != CliMode.Code)
+    {
+        Config.CurrentMode = CliMode.Code;
+        history.Add(("system", "[Switched to Code Mode]"));
+        Console.WriteLine(Ansi.Cyan("\n  ↔ Switched to Code Mode\n"));
+        return (false, true, false);
+    }
+
+    if (isChatCommand && Config.CurrentMode != CliMode.Chat)
+    {
+        Config.CurrentMode = CliMode.Chat;
+        history.Add(("system", "[Switched to Chat Mode]"));
+        Console.WriteLine(Ansi.Cyan("\n  ↔ Switched to Chat Mode\n"));
+        return (false, true, false);
+    }
+
+    return (false, false, false);
+}
+
+void ExportConversationAsMarkdown(List<(string role, string content)> history)
+{
+    if (history.Count == 0)
+    {
+        Console.WriteLine(Ansi.Yellow("\n  No conversation to export.\n"));
+        return;
+    }
+
+    var timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+    var filename = $"conversation_{timestamp}.md";
+
+    var md = new StringBuilder();
+    md.AppendLine("# Stoat Conversation Export");
+    md.AppendLine();
+    md.AppendLine($"**Exported:** {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+    md.AppendLine($"**Model:** {Config.Model}");
+    md.AppendLine($"**Personality:** {Config.DefaultPersonality}");
+    md.AppendLine();
+    md.AppendLine("---");
+    md.AppendLine();
+
+    foreach (var (role, content) in history)
+    {
+        switch (role)
+        {
+            case "user":
+                md.AppendLine("## User\n");
+                md.AppendLine(content + "\n");
+                break;
+            case "assistant":
+                md.AppendLine("## Stoat\n");
+                md.AppendLine(content + "\n");
+                break;
+            case "system":
+                md.AppendLine($"> **System:** {content}\n");
+                break;
+        }
+    }
+
+    File.WriteAllText(filename, md.ToString(), Encoding.UTF8);
+    Console.WriteLine(Ansi.Green($"\n  ✓ Exported to {filename}\n"));
+}
+
+async Task RunChatModeAsync(string task, List<(string role, string content)> history)
+{
+    history.Add(("user", task));
+
     var logFile = ConversationLogger.StartSession(task);
     Console.WriteLine(Ansi.Dim($"  📝 Logging to {logFile}\n"));
 
-    // Phase 1: Ask LLM what files/operations it needs
-    Console.WriteLine(Ansi.Dim("\n  🧠 Stoat is assessing the task...\n"));
-    
-    var tree = FileUtils.WalkDir(cwd);
-    
-    for (int round = 0; round < 5; round++)
+    var prompt = BuildChatPrompt(history);
+
+    Console.WriteLine(Ansi.Dim("\n  💬 Stoat is thinking...\n"));
+    Console.WriteLine(Ansi.Dim(new string('─', 60)));
+
+    var response = await OllamaClient.GenerateStreamAsync(prompt, Config.CurrentPersonality.ChatSystem);
+
+    Console.WriteLine(Ansi.Dim(new string('─', 60)));
+
+    history.Add(("assistant", response));
+    ConversationLogger.LogChatTurn(task, response);
+}
+
+string BuildChatPrompt(List<(string role, string content)> history)
+{
+    var prompt = new StringBuilder();
+    foreach (var (role, content) in history.TakeLast(10))
     {
-        var context = BuildPhase1Context(task, toolResults, readContents, tree);
-        var response = await OllamaClient.GenerateAsync(context, Config.Phase1System);
-        
-        var requests = Parser.ParseToolRequests(response);
-        
-        if (requests.Count == 0)
+        if (role == "user")
+            prompt.AppendLine($"User: {content}");
+        else
+            prompt.AppendLine($"Assistant: {content}");
+    }
+    prompt.Append("Assistant: ");
+    return prompt.ToString();
+}
+
+async Task RunCodeModeAsync(string task, List<(string role, string content)> history)
+{
+    var cwd = Directory.GetCurrentDirectory();
+
+    var logFile = ConversationLogger.StartSession(task);
+    Console.WriteLine(Ansi.Dim($"  📝 Logging to {logFile}\n"));
+
+    // Phase 1: Send file tree, ask LLM which files it needs
+    Console.WriteLine(Ansi.Dim("  🧠 Stoat is assessing the task...\n"));
+
+    var tree = FileUtils.WalkDir(cwd);
+    var phase1Prompt = $"Task: {task.Trim()}\n\nProject files:\n{string.Join("\n", tree)}";
+
+    var phase1Response = await OllamaClient.GenerateAsync(phase1Prompt, Config.CurrentPersonality.Phase1System);
+    var fileList = Parser.ParseFileList(phase1Response);
+
+    ConversationLogger.LogPhase1(phase1Prompt, phase1Response, fileList);
+
+    if (fileList.Count == 0)
+    {
+        Console.WriteLine(Ansi.Yellow("  No files requested - Stoat will create from scratch.\n"));
+    }
+    else
+    {
+        ShowCollectedFiles(fileList, cwd);
+
+        Console.Write(Ansi.Cyan("\n  Send these files? ") + Ansi.Dim("[Y/n/edit] ") + "> ");
+        var confirm = Console.ReadLine()?.Trim() ?? "";
+
+        if (confirm.Equals("n", StringComparison.OrdinalIgnoreCase))
         {
-            var fileList = Parser.ParseFileList(response);
-            if (fileList.Count > 0)
-                requests.Add(new ToolRequest { Tool = "files_needed", Files = fileList });
-            else
-            {
-                Console.WriteLine(Ansi.Yellow("  Stoat didn't request anything.\n"));
-                break;
-            }
+            Console.WriteLine(Ansi.Dim("  Cancelled.\n"));
+            return;
         }
 
-        // Log Phase 1 turn
-        ConversationLogger.LogPhase1(context, response, requests, toolResults);
-        toolResults.Clear();
-
-        ShowRequests(requests);
-
-        Console.Write(Ansi.Cyan("\n  Execute these? ") + Ansi.Dim("[Y/n/edit/proceed] ") + "> ");
-        var confirm = Console.ReadLine() ?? "";
-
-        if (confirm.Trim().Equals("n", StringComparison.OrdinalIgnoreCase)) { Console.WriteLine(Ansi.Dim("  Skipped.\n")); break; }
-        if (confirm.Trim().Equals("edit", StringComparison.OrdinalIgnoreCase))
+        if (confirm.Equals("edit", StringComparison.OrdinalIgnoreCase))
         {
             Console.Write(Ansi.Cyan("\n  Enter file paths (comma-separated):\n  > "));
-            filesToSend = Console.ReadLine()?.Split(',').Select(f => f.Trim()).Where(f => !string.IsNullOrEmpty(f)).ToList() ?? new();
-            break;
+            fileList = Console.ReadLine()?.Split(',')
+                .Select(f => f.Trim())
+                .Where(f => !string.IsNullOrEmpty(f))
+                .ToList() ?? new();
         }
-        if (confirm.Trim().Equals("proceed", StringComparison.OrdinalIgnoreCase)) break;
-
-        // Execute tools
-        Console.WriteLine(Ansi.Dim("\n  🔧 Executing operations..."));
-        
-        foreach (var req in requests)
-        {
-            var result = await ToolExecutor.ExecuteAsync(req, cwd);
-            toolResults.Add(result);
-            ToolExecutor.DisplayResult(result);
-
-            if (req.Tool == "read_file" && result.Success)
-            {
-                var content = Parser.ExtractReadFileContent(result);
-                if (content != null && req.Path != null)
-                    readContents[req.Path] = content;
-            }
-
-            if (req.Tool == "files_needed" && result.Success && result.Data is List<string> files)
-                foreach (var f in files.Where(f => !filesToSend.Contains(f)))
-                    filesToSend.Add(f);
-        }
-
-        Console.Write(Ansi.Cyan("\n  Continue exploring? ") + Ansi.Dim("[y/proceed] ") + "> ");
-        if (!Console.ReadLine()?.Trim().Equals("y", StringComparison.OrdinalIgnoreCase) ?? true)
-            break;
     }
 
-    if (filesToSend.Count == 0)
-        Console.WriteLine(Ansi.Yellow("\n  No files collected - Stoat will create from scratch.\n"));
-    else
-        ShowCollectedFiles(filesToSend);
-
-    // Phase 2: Get code changes
+    // Phase 2: Pack files and get code changes
     Console.WriteLine(Ansi.Dim("\n  📦 Packing files..."));
-    var packed = PackFiles(task, filesToSend, cwd);
+    var packed = PackFiles(task, fileList, cwd);
 
     Console.WriteLine(Ansi.Cyan("\n  🐾 Stoat is working...\n"));
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
-    var response2 = await OllamaClient.GenerateStreamAsync(packed, Config.Phase2System);
+    var response = await OllamaClient.GenerateStreamAsync(packed, Config.CurrentPersonality.Phase2System);
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
 
-    // Parse and apply
-    var blocks = Parser.ParseFileBlocks(response2);
-
-    // Log Phase 2
-    ConversationLogger.LogPhase2(packed, response2, blocks);
+    FileBlock.SaveFileMD(response);
+    
+    var blocks = Parser.ParseFileBlocks(response);
+    ConversationLogger.LogPhase2(packed, response, blocks);
 
     if (blocks.Count == 0)
     {
@@ -177,11 +313,12 @@ async Task RunTaskAsync(string task)
         return;
     }
 
+    // Show proposed changes
     Console.WriteLine(Ansi.Bold($"\n  📝 {blocks.Count} file(s) ready:"));
     foreach (var fb in blocks)
     {
-        var exists = File.Exists(Path.Combine(cwd, fb.Path));
-        Console.WriteLine($"    {(exists ? Ansi.Yellow("~") : Ansi.Green("+"))} {fb.Path} {Ansi.Dim($"({fb.Content.Length} chars)")}");
+        var exists = File.Exists(Path.Combine(cwd, fb.FilePath));
+        Console.WriteLine($"    {(exists ? Ansi.Yellow("~") : Ansi.Green("+"))} {fb.FilePath} {Ansi.Dim($"({fb.Content.Length} chars)")}");
     }
 
     Console.Write(Ansi.Cyan("\n  Apply changes? ") + Ansi.Dim("[Y/n] ") + "> ");
@@ -191,17 +328,18 @@ async Task RunTaskAsync(string task)
         return;
     }
 
+    // Backup and write
     Console.WriteLine(Ansi.Dim("\n  💾 Backing up and writing files..."));
     foreach (var fb in blocks)
     {
-        var fullPath = Path.Combine(cwd, fb.Path);
+        var fullPath = Path.Combine(cwd, fb.FilePath);
         var backup = FileUtils.BackupFile(fullPath);
         if (backup != null)
-            Console.WriteLine(Ansi.Dim($"    ↩ Backed up: {fb.Path}"));
+            Console.WriteLine(Ansi.Dim($"    ↩ Backed up: {fb.FilePath}"));
 
         FileUtils.EnsureDir(Path.GetDirectoryName(fullPath)!);
         File.WriteAllText(fullPath, fb.Content, Encoding.UTF8);
-        Console.WriteLine(Ansi.Green($"    ✓ Written: {fb.Path}"));
+        Console.WriteLine(Ansi.Green($"    ✓ Written: {fb.FilePath}"));
     }
 
     Console.WriteLine(Ansi.Green(Ansi.Bold("\n  ✅ Done!")));
@@ -209,75 +347,18 @@ async Task RunTaskAsync(string task)
     Console.WriteLine(Config.StoatReturnArt);
 }
 
-string BuildPhase1Context(string task, List<ToolResult> results, Dictionary<string, string> readContents, List<string> tree)
+void ShowCollectedFiles(List<string> files, string cwd)
 {
-    var ctx = new StringBuilder();
-    ctx.AppendLine($"Task: {task.Trim()}");
-    ctx.AppendLine();
-
-    if (results.Count > 0)
+    Console.WriteLine(Ansi.Bold($"\n  � {files.Count} file(s) requested:"));
+    foreach (var f in files.Take(20))
     {
-        ctx.AppendLine("Previous results:");
-        foreach (var r in results)
-        {
-            ctx.AppendLine($"  [{r.ToolType}] {r.Message}");
-            if (r.ToolType == "search_files" && r.Data is List<SearchResult> sr)
-                foreach (var s in sr)
-                    ctx.AppendLine($"    - {s.FilePath}:{s.LineNumber}");
-            if (r.ToolType == "list_files" && r.Data is List<string> fl)
-                foreach (var f in fl)
-                    ctx.AppendLine($"    - {f}");
-        }
-        ctx.AppendLine();
+        var exists = File.Exists(Path.Combine(cwd, f));
+        var marker = exists ? Ansi.Green("✓") : Ansi.Yellow("✗");
+        var status = exists ? "" : Ansi.Dim(" (not found)");
+        Console.WriteLine($"    {marker} {f}{status}");
     }
-
-    if (readContents.Count > 0)
-    {
-        ctx.AppendLine("File contents:");
-        foreach (var (path, content) in readContents)
-        {
-            ctx.AppendLine($"[Filename: {path}]");
-            ctx.AppendLine("```");
-            ctx.AppendLine(content);
-            ctx.AppendLine("```");
-            ctx.AppendLine("[End Filename]");
-        }
-        ctx.AppendLine();
-    }
-
-    ctx.AppendLine("Project files:");
-    ctx.Append(string.Join("\n", tree));
-    return ctx.ToString();
-}
-
-void ShowRequests(List<ToolRequest> requests)
-{
-    Console.WriteLine(Ansi.Bold($"\n  📋 Stoat requests:"));
-    foreach (var req in requests)
-    {
-        var desc = req.Tool.ToLowerInvariant() switch
-        {
-            "files_needed" => $"View {req.Files?.Count ?? 0} file(s)",
-            "create_file" => $"Create: {req.Path}",
-            "rename_file" => $"Rename: {req.OldPath} → {req.NewPath}",
-            "move_file" => $"Move: {req.Source} → {req.Destination}",
-            "delete_file" => $"Delete: {req.Path}",
-            "search_files" => $"Search: '{req.Query}'",
-            "list_files" => $"List: {req.Directory ?? "."}",
-            "read_file" => $"Read: {req.Path}",
-            _ => $"Unknown: {req.Tool}"
-        };
-        Console.WriteLine($"    • {desc}");
-    }
-}
-
-void ShowCollectedFiles(List<string> files)
-{
-    Console.WriteLine(Ansi.Bold($"\n  📁 {files.Count} file(s) ready:"));
-    foreach (var f in files.Take(10))
-        Console.WriteLine($"    • {f}");
-    if (files.Count > 10)
-        Console.WriteLine(Ansi.Dim($"    ... and {files.Count - 10} more"));
+    if (files.Count > 20)
+        Console.WriteLine(Ansi.Dim($"    ... and {files.Count - 20} more"));
 }
 
 string PackFiles(string task, List<string> files, string cwd)
@@ -290,18 +371,20 @@ string PackFiles(string task, List<string> files, string cwd)
     {
         var fullPath = Path.Combine(cwd, f);
         var content = FileUtils.ReadFileContents(fullPath);
-        packed.AppendLine($"[Filename: {f}]");
-        packed.AppendLine("```");
+
+        packed.Append(Config.FileTag);
+        packed.Append(f);
+        packed.Append(Config.FileTag);
+        packed.Append(Config.FileStartTag);
         if (content != null)
-            packed.AppendLine(content);
+            packed.Append(content);
         else if (!File.Exists(fullPath))
-            packed.AppendLine("(new file)");
+            packed.Append("(new file)");
         else
-            packed.AppendLine("(binary - skipped)");
-        packed.AppendLine("```");
-        packed.AppendLine("[End Filename]");
-        packed.AppendLine();
+            packed.Append("(binary - skipped)");
+        packed.Append(Config.FileEndTag);
     }
+
     return packed.ToString();
 }
 

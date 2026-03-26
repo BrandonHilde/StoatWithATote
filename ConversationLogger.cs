@@ -8,7 +8,6 @@ internal static class ConversationLogger
     private static readonly string LogDir = ".stoat";
     private static string? _currentSession;
 
-    /// <summary>Starts a new conversation log session.</summary>
     public static string StartSession(string task)
     {
         var timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
@@ -29,8 +28,8 @@ internal static class ConversationLogger
         return _currentSession;
     }
 
-    /// <summary>Logs a Phase 1 turn (LLM request and tool results).</summary>
-    public static void LogPhase1(string prompt, string response, List<ToolRequest> requests, List<ToolResult> results)
+    /// <summary>Logs Phase 1 - file list request.</summary>
+    public static void LogPhase1(string prompt, string response, List<string> fileList)
     {
         if (_currentSession == null) return;
 
@@ -43,19 +42,13 @@ internal static class ConversationLogger
             Timestamp = DateTime.Now,
             Prompt = prompt,
             Response = response,
-            ToolRequests = requests,
-            ToolResults = results.Select(r => new ToolResultLog
-            {
-                Success = r.Success,
-                Message = r.Message,
-                ToolType = r.ToolType
-            }).ToList()
+            FileList = fileList
         });
 
         WriteLog(log);
     }
 
-    /// <summary>Logs the Phase 2 turn (code generation).</summary>
+    /// <summary>Logs Phase 2 - code generation.</summary>
     public static void LogPhase2(string prompt, string response, List<FileBlock> files)
     {
         if (_currentSession == null) return;
@@ -69,13 +62,35 @@ internal static class ConversationLogger
             Timestamp = DateTime.Now,
             Prompt = prompt,
             Response = response,
-            FilesGenerated = files.Select(f => new FileBlockLog { Path = f.Path, ContentLength = f.Content.Length }).ToList()
+            FilesGenerated = files.Select(f => new FileBlockLog
+            {
+                Path = f.FilePath,
+                ContentLength = f.Content.Length
+            }).ToList()
         });
 
         WriteLog(log);
     }
 
-    /// <summary>Logs any exception that occurred.</summary>
+    /// <summary>Logs a chat mode turn.</summary>
+    public static void LogChatTurn(string userMessage, string assistantResponse)
+    {
+        if (_currentSession == null) return;
+
+        var log = ReadLog();
+        if (log == null) return;
+
+        log.Turns.Add(new ConversationTurn
+        {
+            Phase = 0,
+            Timestamp = DateTime.Now,
+            Prompt = userMessage,
+            Response = assistantResponse
+        });
+
+        WriteLog(log);
+    }
+
     public static void LogError(string message)
     {
         if (_currentSession == null) return;
@@ -123,10 +138,10 @@ internal static class ConversationLogger
 }
 
 // Log data structures
+
 internal class ConversationLog
 {
     public DateTime StartTime { get; set; }
-    public string? EndTime { get; set; }
     public string Task { get; set; } = "";
     public string Model { get; set; } = "";
     public string? Error { get; set; }
@@ -139,16 +154,8 @@ internal class ConversationTurn
     public DateTime Timestamp { get; set; }
     public string Prompt { get; set; } = "";
     public string Response { get; set; } = "";
-    public List<ToolRequest>? ToolRequests { get; set; }
-    public List<ToolResultLog>? ToolResults { get; set; }
+    public List<string>? FileList { get; set; }
     public List<FileBlockLog>? FilesGenerated { get; set; }
-}
-
-internal class ToolResultLog
-{
-    public bool Success { get; set; }
-    public string Message { get; set; } = "";
-    public string? ToolType { get; set; }
 }
 
 internal class FileBlockLog
