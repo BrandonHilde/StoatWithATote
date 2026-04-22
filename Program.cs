@@ -12,20 +12,83 @@ if (OperatingSystem.IsWindows())
 
 Console.OutputEncoding = Encoding.UTF8;
 
-Console.WriteLine(Config.StoatArt);
-Console.WriteLine(Ansi.Dim($"  Ollama: {Config.OllamaUrl}"));
-Console.WriteLine(Ansi.Dim("  Set OLLAMA_URL env var to change.\n"));
+Config.Load();
 
-// Check Ollama is running
-if (!await OllamaClient.EnsureRunningAsync())
+// Handle command line arguments
+if (args.Length >= 2 && args[0].Equals("server", StringComparison.OrdinalIgnoreCase))
+{
+    var serverArg = args[1].Trim().ToLowerInvariant();
+    if (Config.Servers.ContainsKey(serverArg))
+    {
+        Config.CurrentServerName = serverArg;
+        Config.Save();
+    }
+    else
+    {
+        Console.WriteLine(Ansi.Red($"✗ Unknown server: {serverArg}"));
+        Console.WriteLine(Ansi.Dim($"Available: {string.Join(", ", Config.Servers.Keys)}"));
+        Environment.Exit(1);
+    }
+}
+
+Console.WriteLine(Config.StoatArt);
+Console.WriteLine(Ansi.Dim($"  Server: {Config.CurrentServer.Name} ({Config.CurrentServer.Url})"));
+Console.WriteLine(Ansi.Dim($"  Config: {Config.ConfigFilePath}"));
+
+if (Config.CurrentServer.Type == ServerType.OpenRouter && string.IsNullOrEmpty(Config.OpenRouterApiKey) && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OPENROUTER_API_KEY")))
+{
+    Console.WriteLine(Ansi.Yellow("  ⚠ OPENROUTER_API_KEY not set."));
+    Console.Write(Ansi.Cyan("  Enter your OpenRouter API key ") + Ansi.Dim("(or press Enter to cancel)") + "> ");
+    var keyInput = Console.ReadLine()?.Trim() ?? "";
+    if (string.IsNullOrEmpty(keyInput))
+    {
+        Console.WriteLine(Ansi.Dim("  Cancelled.\n"));
+        Environment.Exit(1);
+    }
+    Config.OpenRouterApiKey = keyInput;
+    Config.Save();
+    Console.WriteLine(Ansi.Green("  ✓ API key saved.\n"));
+}
+else
+{
+    Console.WriteLine();
+}
+
+// Check server is running
+if (!await LlmClient.EnsureRunningAsync())
     Environment.Exit(1);
 
 // Pick a model
-var models = await OllamaClient.GetModelsAsync();
+var models = await LlmClient.GetModelsAsync();
+
+var isOpenRouter = Config.CurrentServer.Type == ServerType.OpenRouter;
+if (isOpenRouter)
+{
+    models = Config.PreferredModels
+        .Where(p => !string.IsNullOrEmpty(p))
+        .ToList();
+}
 
 if (models.Count == 0)
 {
-    Console.WriteLine(Ansi.Yellow("  ⚠ No models found. Run: ollama pull qwen3:8b\n"));
+    if (isOpenRouter)
+    {
+        Console.Write(Ansi.Cyan("  Enter an OpenRouter model ID ") + Ansi.Dim("(e.g., anthropic/claude-3.5-sonnet)") + "> ");
+        var customModel = Console.ReadLine()?.Trim() ?? "";
+        if (string.IsNullOrEmpty(customModel))
+        {
+            Console.WriteLine(Ansi.Dim("  Cancelled.\n"));
+            Environment.Exit(1);
+        }
+        Config.Model = customModel;
+        Config.PreferredModels.Insert(0, customModel);
+        Config.Save();
+        Console.WriteLine(Ansi.Green($"\n  ✓ Using model: {Config.Model}\n"));
+    }
+    else
+    {
+        Console.WriteLine(Ansi.Yellow("  ⚠ No models found.\n"));
+    }
 }
 else
 {
@@ -36,15 +99,34 @@ else
         Console.WriteLine($"    {marker} [{i + 1}] {models[i]}");
     }
 
-    Console.Write(Ansi.Cyan("\n  Select a model ") + Ansi.Dim($"[1-{models.Count}, Enter = {Config.Model}] ") + "> ");
+    var promptExtra = isOpenRouter ? ", or type a new model ID" : "";
+    Console.Write(Ansi.Cyan("\n  Select a model ") + Ansi.Dim($"[1-{models.Count}, Enter = {Config.Model}{promptExtra}] ") + "> ");
     var pick = Console.ReadLine()?.Trim() ?? "";
 
     if (!string.IsNullOrEmpty(pick) && int.TryParse(pick, out var idx) && idx >= 1 && idx <= models.Count)
+    {
         Config.Model = models[idx - 1];
+    }
+    else if (!string.IsNullOrEmpty(pick) && isOpenRouter)
+    {
+        Config.Model = pick;
+        if (!Config.PreferredModels.Any(p => p.Equals(pick, StringComparison.OrdinalIgnoreCase)))
+        {
+            Config.PreferredModels.Insert(0, pick);
+        }
+    }
     else if (!models.Any(m => m.Equals(Config.Model, StringComparison.OrdinalIgnoreCase)))
+    {
         Config.Model = models[0];
+    }
+
+    if (isOpenRouter && !Config.PreferredModels.Any(p => p.Equals(Config.Model, StringComparison.OrdinalIgnoreCase)))
+    {
+        Config.PreferredModels.Insert(0, Config.Model);
+    }
 
     Console.WriteLine(Ansi.Green($"\n  ✓ Using model: {Config.Model}\n"));
+    Config.Save();
 }
 
 // Personality selection
@@ -67,6 +149,7 @@ if (!string.IsNullOrEmpty(personalityPick) && int.TryParse(personalityPick, out 
 
 Config.CurrentPersonality = StoatPersonalityManager.GetPersonality(Config.DefaultPersonality);
 Console.WriteLine(Ansi.Green($"\n  ✓ Using personality: {Config.DefaultPersonality}\n"));
+Config.Save();
 
 // Mode selection
 Console.WriteLine(Ansi.Bold("  🎯 Select Mode:"));
@@ -81,6 +164,7 @@ else
     Config.CurrentMode = CliMode.Code;
 
 Console.WriteLine(Ansi.Green($"\n  ✓ Starting in {Config.CurrentMode} Mode\n"));
+Config.Save();
 Console.WriteLine(Ansi.Dim("  Type 'help' for commands, 'code' or 'chat' to switch modes.\n"));
 
 var chatHistory = new List<(string role, string content)>();
@@ -138,6 +222,7 @@ while (true)
         Console.WriteLine("    quit, exit, q  " + Ansi.Dim("- Exit the application"));
         Console.WriteLine("    code           " + Ansi.Dim("- Switch to Code Mode"));
         Console.WriteLine("    chat           " + Ansi.Dim("- Switch to Chat Mode"));
+        Console.WriteLine("    server [name]  " + Ansi.Dim("- Switch server (ollama, llamacpp, openrouter)"));
         Console.WriteLine("    export         " + Ansi.Dim("- Export conversation as markdown file"));
         Console.WriteLine(Ansi.Dim("  (Or type your message to continue in current mode)\n"));
         return (false, false, true);
@@ -149,12 +234,32 @@ while (true)
         return (false, false, true);
     }
 
+    if (trimmed == "server" || trimmed.StartsWith("server "))
+    {
+        var arg = trimmed.Length > 7 ? trimmed.Substring(7).Trim() : "";
+        if (string.IsNullOrEmpty(arg))
+        {
+            Console.WriteLine(Ansi.Bold("\n  🖥  Servers:"));
+            foreach (var kvp in Config.Servers)
+            {
+                var marker = kvp.Key.Equals(Config.CurrentServerName, StringComparison.OrdinalIgnoreCase) ? Ansi.Green("►") : " ";
+                Console.WriteLine($"    {marker} {kvp.Key,-12} {Ansi.Dim(kvp.Value.Url)}");
+            }
+            Console.WriteLine();
+            return (false, false, true);
+        }
+
+        Task.Run(async () => await SwitchServerAsync(arg, history)).GetAwaiter().GetResult();
+        return (false, true, false);
+    }
+
     bool isCodeCommand = trimmed is "mode code" or "code" or "/code";
     bool isChatCommand = trimmed is "mode chat" or "chat" or "/chat";
 
     if (isCodeCommand && Config.CurrentMode != CliMode.Code)
     {
         Config.CurrentMode = CliMode.Code;
+        Config.Save();
         history.Add(("system", "[Switched to Code Mode]"));
         Console.WriteLine(Ansi.Cyan("\n  ↔ Switched to Code Mode\n"));
         return (false, true, false);
@@ -163,12 +268,133 @@ while (true)
     if (isChatCommand && Config.CurrentMode != CliMode.Chat)
     {
         Config.CurrentMode = CliMode.Chat;
+        Config.Save();
         history.Add(("system", "[Switched to Chat Mode]"));
         Console.WriteLine(Ansi.Cyan("\n  ↔ Switched to Chat Mode\n"));
         return (false, true, false);
     }
 
     return (false, false, false);
+}
+
+async Task SwitchServerAsync(string serverName, List<(string role, string content)> history)
+{
+    if (!Config.Servers.ContainsKey(serverName))
+    {
+        Console.WriteLine(Ansi.Red($"\n  ✗ Unknown server: {serverName}"));
+        Console.WriteLine(Ansi.Dim($"  Available: {string.Join(", ", Config.Servers.Keys)}\n"));
+        return;
+    }
+
+    if (Config.CurrentServerName.Equals(serverName, StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine(Ansi.Yellow($"\n  Already using {serverName}\n"));
+        return;
+    }
+
+    Config.CurrentServerName = serverName;
+    Console.WriteLine(Ansi.Cyan($"\n  ↔ Switched to {Config.CurrentServer.Name} ({Config.CurrentServer.Url})\n"));
+
+    if (Config.CurrentServer.Type == ServerType.OpenRouter && string.IsNullOrEmpty(Config.OpenRouterApiKey) && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OPENROUTER_API_KEY")))
+    {
+        Console.Write(Ansi.Cyan("  Enter your OpenRouter API key ") + Ansi.Dim("(or press Enter to cancel)") + "> ");
+        var keyInput = Console.ReadLine()?.Trim() ?? "";
+        if (string.IsNullOrEmpty(keyInput))
+        {
+            Console.WriteLine(Ansi.Dim("  Cancelled.\n"));
+            Config.CurrentServerName = "ollama";
+            Console.WriteLine(Ansi.Cyan("  ↔ Reverted to ollama\n"));
+            return;
+        }
+        Config.OpenRouterApiKey = keyInput;
+        Config.Save();
+        Console.WriteLine(Ansi.Green("  ✓ API key saved.\n"));
+    }
+
+    if (!await LlmClient.EnsureRunningAsync())
+    {
+        Console.WriteLine(Ansi.Yellow("  ⚠ Server not reachable. You may need to start it manually.\n"));
+        return;
+    }
+
+    var models = await LlmClient.GetModelsAsync();
+    var isOpenRouter = Config.CurrentServer.Type == ServerType.OpenRouter;
+    if (isOpenRouter)
+    {
+        models = Config.PreferredModels
+            .Where(p => !string.IsNullOrEmpty(p))
+            .ToList();
+    }
+
+    if (models.Count == 0)
+    {
+        if (isOpenRouter)
+        {
+            Console.Write(Ansi.Cyan("  Enter an OpenRouter model ID ") + Ansi.Dim("(e.g., anthropic/claude-3.5-sonnet)") + "> ");
+            var customModel = Console.ReadLine()?.Trim() ?? "";
+            if (string.IsNullOrEmpty(customModel))
+            {
+                Console.WriteLine(Ansi.Dim("  Cancelled.\n"));
+                Config.CurrentServerName = "ollama";
+                Console.WriteLine(Ansi.Cyan("  ↔ Reverted to ollama\n"));
+                return;
+            }
+            Config.Model = customModel;
+            Config.PreferredModels.Insert(0, customModel);
+            Config.Save();
+            Console.WriteLine(Ansi.Green($"\n  ✓ Using model: {Config.Model}\n"));
+        }
+        else
+        {
+            Console.WriteLine(Ansi.Yellow("  ⚠ No models found on this server.\n"));
+        }
+    }
+    else
+    {
+        var currentExists = models.Any(m => m.Equals(Config.Model, StringComparison.OrdinalIgnoreCase));
+        if (!currentExists)
+        {
+            Console.WriteLine(Ansi.Yellow($"  ⚠ Current model '{Config.Model}' not found on this server."));
+            Console.WriteLine(Ansi.Bold("  🗂  Available models:"));
+            for (int i = 0; i < models.Count; i++)
+            {
+                Console.WriteLine($"    [{i + 1}] {models[i]}");
+            }
+            var promptExtra = isOpenRouter ? ", or type a new model ID" : "";
+            Console.Write(Ansi.Cyan("\n  Select a model ") + Ansi.Dim($"[1-{models.Count}{promptExtra}] ") + "> ");
+            var pick = Console.ReadLine()?.Trim() ?? "";
+            if (int.TryParse(pick, out var idx) && idx >= 1 && idx <= models.Count)
+            {
+                Config.Model = models[idx - 1];
+            }
+            else if (!string.IsNullOrEmpty(pick) && isOpenRouter)
+            {
+                Config.Model = pick;
+                if (!Config.PreferredModels.Any(p => p.Equals(pick, StringComparison.OrdinalIgnoreCase)))
+                {
+                    Config.PreferredModels.Insert(0, pick);
+                }
+            }
+            else
+            {
+                Config.Model = models[0];
+            }
+
+            if (isOpenRouter && !Config.PreferredModels.Any(p => p.Equals(Config.Model, StringComparison.OrdinalIgnoreCase)))
+            {
+                Config.PreferredModels.Insert(0, Config.Model);
+            }
+
+            Console.WriteLine(Ansi.Green($"\n  ✓ Using model: {Config.Model}\n"));
+        }
+        else
+        {
+            Console.WriteLine(Ansi.Green($"  ✓ Model {Config.Model} is available.\n"));
+        }
+    }
+
+    Config.Save();
+    history.Add(("system", $"[Switched to {Config.CurrentServer.Name} server]"));
 }
 
 void ExportConversationAsMarkdown(List<(string role, string content)> history)
@@ -186,6 +412,7 @@ void ExportConversationAsMarkdown(List<(string role, string content)> history)
     md.AppendLine("# Stoat Conversation Export");
     md.AppendLine();
     md.AppendLine($"**Exported:** {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+    md.AppendLine($"**Server:** {Config.CurrentServer.Name}");
     md.AppendLine($"**Model:** {Config.Model}");
     md.AppendLine($"**Personality:** {Config.DefaultPersonality}");
     md.AppendLine();
@@ -226,7 +453,7 @@ async Task RunChatModeAsync(string task, List<(string role, string content)> his
     Console.WriteLine(Ansi.Dim("\n  💬 Stoat is thinking...\n"));
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
 
-    var response = await OllamaClient.GenerateStreamAsync(prompt, Config.CurrentPersonality.ChatSystem);
+    var response = await LlmClient.GenerateStreamAsync(prompt, Config.CurrentPersonality.ChatSystem);
 
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
 
@@ -261,7 +488,7 @@ async Task RunCodeModeAsync(string task, List<(string role, string content)> his
     var tree = FileUtils.WalkDir(cwd);
     var phase1Prompt = $"Task: {task.Trim()}\n\nProject files:\n{string.Join("\n", tree)}";
 
-    var phase1Response = await OllamaClient.GenerateAsync(phase1Prompt, Config.CurrentPersonality.Phase1System);
+    var phase1Response = await LlmClient.GenerateAsync(phase1Prompt, Config.CurrentPersonality.Phase1System);
     var fileList = Parser.ParseFileList(phase1Response);
 
     ConversationLogger.LogPhase1(phase1Prompt, phase1Response, fileList);
@@ -299,11 +526,11 @@ async Task RunCodeModeAsync(string task, List<(string role, string content)> his
 
     Console.WriteLine(Ansi.Cyan("\n  🐾 Stoat is working...\n"));
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
-    var response = await OllamaClient.GenerateStreamAsync(packed, Config.CurrentPersonality.Phase2System);
+    var response = await LlmClient.GenerateStreamAsync(packed, Config.CurrentPersonality.Phase2System);
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
 
     FileBlock.SaveFileMD(response);
-    
+
     var blocks = Parser.ParseFileBlocks(response);
     ConversationLogger.LogPhase2(packed, response, blocks);
 
@@ -349,7 +576,7 @@ async Task RunCodeModeAsync(string task, List<(string role, string content)> his
 
 void ShowCollectedFiles(List<string> files, string cwd)
 {
-    Console.WriteLine(Ansi.Bold($"\n  � {files.Count} file(s) requested:"));
+    Console.WriteLine(Ansi.Bold($"\n  📎 {files.Count} file(s) requested:"));
     foreach (var f in files.Take(20))
     {
         var exists = File.Exists(Path.Combine(cwd, f));

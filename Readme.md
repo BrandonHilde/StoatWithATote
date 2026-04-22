@@ -49,6 +49,7 @@ dotnet run --project stoat.csproj
 Publish:
 ```
 dotnet publish stoat.csproj -c Release -o .\publish 2>&1
+Linux: brandon@fedora:~$ dotnet publish stoat.csproj -c Release -o .\publish --runtime linux-x64   
 ```
 Start:
 ```
