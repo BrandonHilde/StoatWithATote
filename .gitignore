@@ -1,5 +1,6 @@
 .stoat-backups/
 .stoat/
+.publish/
 publish/
 bin/
 obj/
