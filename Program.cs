@@ -176,7 +176,7 @@ while (true)
         ? Ansi.Magenta("[CHAT] ")
         : Ansi.Green("[CODE] ");
 
-    Console.Write(Ansi.Cyan($"\n{modeIndicator}What do you need? ") + Ansi.Dim("(type 'help' for commands)\n> "));
+    Console.Write(Ansi.Cyan($"\n{modeIndicator}Stoat is awaiting your request: ") + Ansi.Dim("(type 'help' for commands)\n> "));
 
     var input = Console.ReadLine() ?? "";
 

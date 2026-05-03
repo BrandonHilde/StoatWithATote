@@ -1,4 +1,5 @@
 using System.IO;
+using System.Text.RegularExpressions;
 
 namespace StoatTote;
 
@@ -43,6 +44,37 @@ public class FileBlock
         {
             fb = GetNextFileBlock(content, fb.GetIndex());
             if(fb != null) fileBlocks.Add(fb.Copy());
+        }
+
+        if (fileBlocks.Count == 0)
+            fileBlocks = ParseMarkdownFiles(content);
+
+        return fileBlocks;
+    }
+
+    public static List<FileBlock> ParseMarkdownFiles(string content)
+    {
+        var fileBlocks = new List<FileBlock>();
+
+        content = content.Replace("\r\n", "\n");
+
+        var regex = new Regex(
+            @"\*\*(.+?)\*\*\s*```[^\n]*\n(.*?)\n```",
+            RegexOptions.Singleline);
+
+        var matches = regex.Matches(content);
+
+        foreach (Match match in matches)
+        {
+            string fn = match.Groups[1].Value.Trim();
+            string fc = match.Groups[2].Value;
+
+            if (!IsValidFilePath(fn))
+                continue;
+
+            fc = fc.Replace("\n", "\r\n");
+
+            fileBlocks.Add(new FileBlock(fn, fc, match.Index + match.Length));
         }
 
         return fileBlocks;

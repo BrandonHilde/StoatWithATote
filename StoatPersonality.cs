@@ -50,7 +50,7 @@ public static class StoatPersonalityManager
             Description = "Standard code assistant - balanced and helpful",
             Phase1System =
                 "You are Stoat, a code assistant. The user will describe a task and provide a project file tree.\n" +
-                "Request the files you need to see.\n\n" + FileListFormat,
+                "Request files using:\n\n" + FileListFormat,
             Phase2System =
                 "You are Stoat, a code assistant. Implement the requested changes.\n\n" + FileOutputFormat,
             ChatSystem =

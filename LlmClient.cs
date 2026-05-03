@@ -65,6 +65,64 @@ internal static class LlmClient
         return request;
     }
 
+    private static void WriteToken(string text, StringBuilder response, ref bool inThinking)
+    {
+        int i = 0;
+        while (i < text.Length)
+        {
+            if (!inThinking)
+            {
+                var nextThink = text.IndexOf("\u003cthink\u003e", i, StringComparison.Ordinal);
+                var nextThinking = text.IndexOf("\u003cthinking\u003e", i, StringComparison.Ordinal);
+                var start = nextThink >= 0 ? nextThink : nextThinking;
+                if (nextThink >= 0 && nextThinking >= 0)
+                    start = Math.Min(nextThink, nextThinking);
+                else if (nextThinking >= 0)
+                    start = nextThinking;
+
+                if (start >= 0)
+                {
+                    if (start > i)
+                        Console.Write(text.Substring(i, start - i));
+                    inThinking = true;
+                    i = start;
+                }
+                else
+                {
+                    Console.Write(text.Substring(i));
+                    break;
+                }
+            }
+            else
+            {
+                var endThink = text.IndexOf("\u003c/think\u003e", i, StringComparison.Ordinal);
+                var endThinking = text.IndexOf("\u003c/thinking\u003e", i, StringComparison.Ordinal);
+                var end = endThink >= 0 ? endThink : endThinking;
+                if (endThink >= 0 && endThinking >= 0)
+                    end = Math.Min(endThink, endThinking);
+                else if (endThinking >= 0)
+                    end = endThinking;
+
+                if (end >= 0)
+                {
+                    var thinkContent = text.Substring(i, end - i);
+                    if (!string.IsNullOrEmpty(thinkContent))
+                        Console.Write(Ansi.Dim(thinkContent));
+                    inThinking = false;
+                    var endTag = endThink == end ? "\u003c/think\u003e" : "\u003c/thinking\u003e";
+                    Console.Write(Ansi.Dim(text.Substring(end, endTag.Length)));
+                    i = end + endTag.Length;
+                }
+                else
+                {
+                    Console.Write(Ansi.Dim(text.Substring(i)));
+                    break;
+                }
+            }
+        }
+        response.Append(text);
+    }
+
     /// <summary>Non-streaming generate - returns full response.</summary>
     public static async Task<string> GenerateAsync(string prompt, string system = "")
     {
@@ -110,6 +168,7 @@ internal static class LlmClient
         using var reader = new StreamReader(stream, Encoding.UTF8);
 
         var response = new StringBuilder();
+        bool inThinking = false;
 
         if (IsOpenAiCompatible)
         {
@@ -128,11 +187,16 @@ internal static class LlmClient
                     if (doc.RootElement.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0)
                     {
                         var choice = choices[0];
-                        if (choice.TryGetProperty("delta", out var delta) && delta.TryGetProperty("content", out var token))
+                        if (choice.TryGetProperty("delta", out var delta2) && delta2.TryGetProperty("reasoning_content", out var reasoningToken))
+                        {
+                            var text = reasoningToken.GetString() ?? "";
+                            Console.Write(Ansi.Dim(text));
+                            response.Append(text);
+                        }
+                        else if (choice.TryGetProperty("delta", out var delta) && delta.TryGetProperty("content", out var token))
                         {
                             var text = token.GetString() ?? "";
-                            Console.Write(text);
-                            response.Append(text);
+                            WriteToken(text, response, ref inThinking);
                         }
                     }
                 }
@@ -152,8 +216,7 @@ internal static class LlmClient
                     if (doc.RootElement.TryGetProperty("response", out var token))
                     {
                         var text = token.GetString() ?? "";
-                        Console.Write(text);
-                        response.Append(text);
+                        WriteToken(text, response, ref inThinking);
                     }
                 }
                 catch { /* skip malformed lines */ }
@@ -171,23 +234,23 @@ internal static class LlmClient
 
         if (ServerType == ServerType.Ollama)
         {
-            Console.WriteLine(Ansi.Yellow($"  ⚠ Ollama not reachable at {BaseUrl} - attempting to start..."));
+            Console.WriteLine(Ansi.Yellow($"  \u26a0 Ollama not reachable at {BaseUrl} - attempting to start..."));
             if (!await TryStartOllamaAsync())
             {
-                Console.WriteLine(Ansi.Red("  ✗ Could not start Ollama. Please start it manually.\n"));
+                Console.WriteLine(Ansi.Red("  \u2717 Could not start Ollama. Please start it manually.\n"));
                 return false;
             }
-            Console.WriteLine(Ansi.Green("  ✓ Ollama started.\n"));
+            Console.WriteLine(Ansi.Green("  \u2713 Ollama started.\n"));
             return true;
         }
         else if (ServerType == ServerType.OpenRouter)
         {
-            Console.WriteLine(Ansi.Red($"  ✗ OpenRouter not reachable at {BaseUrl}. Check your internet connection and API key.\n"));
+            Console.WriteLine(Ansi.Red($"  \u2717 OpenRouter not reachable at {BaseUrl}. Check your internet connection and API key.\n"));
             return false;
         }
         else
         {
-            Console.WriteLine(Ansi.Red($"  ✗ llama.cpp server not reachable at {BaseUrl}. Please start it manually.\n"));
+            Console.WriteLine(Ansi.Red($"  \u2717 llama.cpp server not reachable at {BaseUrl}. Please start it manually.\n"));
             return false;
         }
     }
@@ -261,7 +324,7 @@ internal static class LlmClient
         }
         catch (Exception ex)
         {
-            Console.WriteLine(Ansi.Red($"  ✗ Failed to launch: {ex.Message}"));
+            Console.WriteLine(Ansi.Red($"  \u2717 Failed to launch: {ex.Message}"));
             return false;
         }
 
