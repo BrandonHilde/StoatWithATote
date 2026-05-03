@@ -99,6 +99,8 @@ internal static class LlmClient
         using var request = BuildRequest(HttpMethod.Post, $"{BaseUrl}{GenerateEndpoint}");
         request.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
+        Console.WriteLine(Ansi.Dim($"  [DEBUG] Sending to {Config.CurrentServer.Name} ({json.Length:N0} bytes)..."));
+
         using var res = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 
         if (!res.IsSuccessStatusCode)

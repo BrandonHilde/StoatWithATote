@@ -450,7 +450,7 @@ async Task RunChatModeAsync(string task, List<(string role, string content)> his
 
     var prompt = BuildChatPrompt(history);
 
-    Console.WriteLine(Ansi.Dim("\n  💬 Stoat is thinking...\n"));
+    Console.WriteLine(Ansi.Dim("\n  💬 Stoat:\n"));
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
 
     var response = await LlmClient.GenerateStreamAsync(prompt, Config.CurrentPersonality.ChatSystem);
@@ -483,12 +483,11 @@ async Task RunCodeModeAsync(string task, List<(string role, string content)> his
     Console.WriteLine(Ansi.Dim($"  📝 Logging to {logFile}\n"));
 
     // Phase 1: Send file tree, ask LLM which files it needs
-    Console.WriteLine(Ansi.Dim("  🧠 Stoat is assessing the task...\n"));
 
     var tree = FileUtils.WalkDir(cwd);
     var phase1Prompt = $"Task: {task.Trim()}\n\nProject files:\n{string.Join("\n", tree)}";
 
-    var phase1Response = await LlmClient.GenerateAsync(phase1Prompt, Config.CurrentPersonality.Phase1System);
+    var phase1Response = await LlmClient.GenerateStreamAsync(phase1Prompt, Config.CurrentPersonality.Phase1System);
     var fileList = Parser.ParseFileList(phase1Response);
 
     ConversationLogger.LogPhase1(phase1Prompt, phase1Response, fileList);
