@@ -16,21 +16,37 @@ internal static class LlmClient
 
     private static bool IsOpenAiCompatible => ServerType is ServerType.LlamaCpp or ServerType.OpenRouter;
 
-    private static object BuildOllamaBody(string prompt, string system, bool stream) => new
+    private static readonly JsonSerializerOptions BodyJsonOptions = new()
+    {
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+
+    private static object BuildOllamaBody(string prompt, string system, bool stream, IReadOnlyList<ImageAttachment>? images) => new
     {
         model = Config.Model,
         prompt,
         system,
         stream,
+        images = images is { Count: > 0 } ? images.Select(i => i.Base64).ToArray() : null,
         options = new { temperature = 0, num_ctx = 32768 }
     };
 
-    private static object BuildOpenAiBody(string prompt, string system, bool stream)
+    private static object BuildOpenAiBody(string prompt, string system, bool stream, IReadOnlyList<ImageAttachment>? images)
     {
         var messages = new List<object>();
         if (!string.IsNullOrEmpty(system))
             messages.Add(new { role = "system", content = system });
-        messages.Add(new { role = "user", content = prompt });
+
+        if (images is { Count: > 0 })
+        {
+            var parts = new List<object> { new { type = "text", text = prompt } };
+            parts.AddRange(images.Select(i => new { type = "image_url", image_url = new { url = i.DataUrl } }));
+            messages.Add(new { role = "user", content = parts });
+        }
+        else
+        {
+            messages.Add(new { role = "user", content = prompt });
+        }
 
         return new
         {
@@ -41,11 +57,11 @@ internal static class LlmClient
         };
     }
 
-    private static string SerializeBody(string prompt, string system, bool stream)
+    private static string SerializeBody(string prompt, string system, bool stream, IReadOnlyList<ImageAttachment>? images)
     {
         return IsOpenAiCompatible
-            ? JsonSerializer.Serialize(BuildOpenAiBody(prompt, system, stream))
-            : JsonSerializer.Serialize(BuildOllamaBody(prompt, system, stream));
+            ? JsonSerializer.Serialize(BuildOpenAiBody(prompt, system, stream, images), BodyJsonOptions)
+            : JsonSerializer.Serialize(BuildOllamaBody(prompt, system, stream, images), BodyJsonOptions);
     }
 
     private static string GenerateEndpoint => ServerType switch
@@ -123,10 +139,34 @@ internal static class LlmClient
         response.Append(text);
     }
 
-    /// <summary>Non-streaming generate - returns full response.</summary>
-    public static async Task<string> GenerateAsync(string prompt, string system = "")
+    private static string? GetString(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    /// <summary>Writes separately-streamed reasoning, wrapped in think tags so the parser can skip it.</summary>
+    private static void WriteReasoning(string text, StringBuilder response, ref bool inReasoning)
     {
-        var json = SerializeBody(prompt, system, stream: false);
+        if (!inReasoning)
+        {
+            response.Append("<think>");
+            inReasoning = true;
+        }
+        Console.Write(Ansi.Dim(text));
+        response.Append(text);
+    }
+
+    private static void EndReasoning(StringBuilder response, ref bool inReasoning)
+    {
+        if (!inReasoning) return;
+        response.Append("</think>");
+        inReasoning = false;
+    }
+
+    /// <summary>Non-streaming generate - returns full response.</summary>
+    public static async Task<string> GenerateAsync(string prompt, string system = "", IReadOnlyList<ImageAttachment>? images = null)
+    {
+        var json = SerializeBody(prompt, system, stream: false, images);
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
         using var request = BuildRequest(HttpMethod.Post, $"{BaseUrl}{GenerateEndpoint}", content);
         using var res = await Http.SendAsync(request);
@@ -151,9 +191,9 @@ internal static class LlmClient
     }
 
     /// <summary>Streaming generate - streams to console and returns full response.</summary>
-    public static async Task<string> GenerateStreamAsync(string prompt, string system = "")
+    public static async Task<string> GenerateStreamAsync(string prompt, string system = "", IReadOnlyList<ImageAttachment>? images = null)
     {
-        var json = SerializeBody(prompt, system, stream: true);
+        var json = SerializeBody(prompt, system, stream: true, images);
         using var request = BuildRequest(HttpMethod.Post, $"{BaseUrl}{GenerateEndpoint}");
         request.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -169,6 +209,7 @@ internal static class LlmClient
 
         var response = new StringBuilder();
         bool inThinking = false;
+        bool inReasoning = false;
 
         if (IsOpenAiCompatible)
         {
@@ -186,17 +227,19 @@ internal static class LlmClient
                     using var doc = JsonDocument.Parse(data);
                     if (doc.RootElement.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0)
                     {
-                        var choice = choices[0];
-                        if (choice.TryGetProperty("delta", out var delta2) && delta2.TryGetProperty("reasoning_content", out var reasoningToken))
+                        if (choices[0].TryGetProperty("delta", out var delta))
                         {
-                            var text = reasoningToken.GetString() ?? "";
-                            Console.Write(Ansi.Dim(text));
-                            response.Append(text);
-                        }
-                        else if (choice.TryGetProperty("delta", out var delta) && delta.TryGetProperty("content", out var token))
-                        {
-                            var text = token.GetString() ?? "";
-                            WriteToken(text, response, ref inThinking);
+                            // llama.cpp sends reasoning_content, OpenRouter sends reasoning
+                            var reasoning = GetString(delta, "reasoning_content") ?? GetString(delta, "reasoning");
+                            if (!string.IsNullOrEmpty(reasoning))
+                                WriteReasoning(reasoning, response, ref inReasoning);
+
+                            var text = GetString(delta, "content");
+                            if (!string.IsNullOrEmpty(text))
+                            {
+                                EndReasoning(response, ref inReasoning);
+                                WriteToken(text, response, ref inThinking);
+                            }
                         }
                     }
                 }
@@ -213,9 +256,16 @@ internal static class LlmClient
                 try
                 {
                     using var doc = JsonDocument.Parse(line);
-                    if (doc.RootElement.TryGetProperty("response", out var token))
+
+                    // Newer Ollama versions send reasoning separately as "thinking"
+                    var reasoning = GetString(doc.RootElement, "thinking");
+                    if (!string.IsNullOrEmpty(reasoning))
+                        WriteReasoning(reasoning, response, ref inReasoning);
+
+                    var text = GetString(doc.RootElement, "response");
+                    if (!string.IsNullOrEmpty(text))
                     {
-                        var text = token.GetString() ?? "";
+                        EndReasoning(response, ref inReasoning);
                         WriteToken(text, response, ref inThinking);
                     }
                 }
@@ -223,6 +273,7 @@ internal static class LlmClient
             }
         }
 
+        EndReasoning(response, ref inReasoning);
         Console.WriteLine();
         return StoatStandards.StandardizeText(response.ToString());
     }
@@ -293,6 +344,71 @@ internal static class LlmClient
             }
         }
         catch { return []; }
+    }
+
+    /// <summary>
+    /// Asks the server whether the current model accepts images.
+    /// Returns null when the server doesn't say (older versions, network errors).
+    /// </summary>
+    public static async Task<bool?> SupportsVisionAsync()
+    {
+        try
+        {
+            switch (ServerType)
+            {
+                case ServerType.Ollama:
+                {
+                    var body = JsonSerializer.Serialize(new { model = Config.Model });
+                    using var res = await Http.PostAsync($"{BaseUrl}/api/show", new StringContent(body, Encoding.UTF8, "application/json"));
+                    if (!res.IsSuccessStatusCode) return null;
+
+                    using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
+                    if (doc.RootElement.TryGetProperty("capabilities", out var caps) && caps.ValueKind == JsonValueKind.Array)
+                        return caps.EnumerateArray().Any(c => c.GetString() == "vision");
+
+                    // Older Ollama: vision models ship a projector
+                    return doc.RootElement.TryGetProperty("projector_info", out _) ? true : null;
+                }
+
+                case ServerType.LlamaCpp:
+                {
+                    // One model per server; vision needs the server started with --mmproj
+                    using var request = BuildRequest(HttpMethod.Get, $"{BaseUrl}/props");
+                    using var res = await Http.SendAsync(request);
+                    if (!res.IsSuccessStatusCode) return null;
+
+                    using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
+                    if (doc.RootElement.TryGetProperty("modalities", out var modalities)
+                        && modalities.TryGetProperty("vision", out var vision)
+                        && vision.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                        return vision.GetBoolean();
+                    return null;
+                }
+
+                case ServerType.OpenRouter:
+                {
+                    using var request = BuildRequest(HttpMethod.Get, $"{BaseUrl}/models");
+                    using var res = await Http.SendAsync(request);
+                    if (!res.IsSuccessStatusCode) return null;
+
+                    using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
+                    foreach (var model in doc.RootElement.GetProperty("data").EnumerateArray())
+                    {
+                        if (GetString(model, "id") != Config.Model) continue;
+
+                        if (model.TryGetProperty("architecture", out var arch)
+                            && arch.TryGetProperty("input_modalities", out var inputs)
+                            && inputs.ValueKind == JsonValueKind.Array)
+                            return inputs.EnumerateArray().Any(m => m.GetString() == "image");
+                        return null;
+                    }
+                    return null;
+                }
+            }
+        }
+        catch { /* treat as unknown */ }
+
+        return null;
     }
 
     private static async Task<bool> IsReachableAsync()

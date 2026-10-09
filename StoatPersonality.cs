@@ -26,21 +26,21 @@ public class StoatPersonality
 /// </summary>
 public static class StoatPersonalityManager
 {
+    // Plain markdown: small local models follow it far more reliably than custom tags
     private const string FileListFormat =
-        "To request files, respond with:\n\n" +
-        "[File List Start]\n" +
-        "path/to/file1\n" +
-        "path/to/file2\n" +
-        "[File List End]\n\n" +
-        "List one file per line. Only request files from the project tree.";
+        "List the files you need to see, one path per line, copied exactly from the project tree. " +
+        "Do not write any code yet. Example:\n\n" +
+        "src/app.py\n" +
+        "src/utils.py";
 
     private const string FileOutputFormat =
-        "Return every file you modify or create using this exact format:\n\n" +
-        "[FILENAME]path/to/file.ext[FILENAME]\n" +
-        "[START FILE CONTENTS]\n" +
-        "complete file content here\n" +
-        "[END FILE CONTENTS]\n\n" +
-        "Return complete files, not diffs. Only include files that need changes.";
+        "For each file you create or change, write its path on its own line, " +
+        "then the complete file in a code block. Example:\n\n" +
+        "src/app.py\n" +
+        "```python\n" +
+        "print(\"hello\")\n" +
+        "```\n\n" +
+        "Always write the whole file, never a diff or a snippet. Only include files that change.";
 
     public static readonly Dictionary<string, StoatPersonality> BuiltInPersonalities = new()
     {

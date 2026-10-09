@@ -22,6 +22,18 @@ public enum ServerType
 }
 
 /// <summary>
+/// What the model may do on the web.
+/// </summary>
+public enum WebMode
+{
+    Off,        // No web access, and the model isn't told about it
+    Ask,        // Whitelisted sites allowed, blacklisted blocked, anything else asks the user
+    Whitelist,  // Only whitelisted sites (plus the configured search engine)
+    Blacklist,  // Everything except blacklisted sites
+    Full        // Everything
+}
+
+/// <summary>
 /// Preset configuration for a server backend.
 /// </summary>
 public record ServerPreset(string Name, string Url, ServerType Type);
@@ -37,6 +49,10 @@ public class SavedConfig
     public CliMode Mode { get; set; } = CliMode.Code;
     public string? OpenRouterApiKey { get; set; }
     public List<string> PreferredModels { get; set; } = [];
+    public WebMode WebMode { get; set; } = WebMode.Ask;
+    public List<string> WebWhitelist { get; set; } = [];
+    public List<string> WebBlacklist { get; set; } = [];
+    public string? WebSearchUrl { get; set; }
 }
 
 internal static class Config
@@ -67,6 +83,9 @@ internal static class Config
 
     public static string Model { get; set; } = "qwen3:8b";
 
+    /// <summary>Whether the current model accepts images; null when the server didn't say.</summary>
+    public static bool? ModelSupportsVision { get; set; }
+
     public static string DefaultPersonality { get; set; } = "default";
 
     public static StoatPersonality CurrentPersonality { get; set; } = StoatPersonalityManager.GetPersonality("default");
@@ -77,6 +96,19 @@ internal static class Config
 
     public static List<string> PreferredModels { get; set; } = [];
 
+    public static WebMode WebMode { get; set; } = WebMode.Ask;
+    public static List<string> WebWhitelist { get; set; } = [];
+    public static List<string> WebBlacklist { get; set; } = [];
+
+    // {query} is replaced with the search terms; a SearXNG URL with &format=json also works
+    public const string DefaultSearchUrl = "https://html.duckduckgo.com/html/?q={query}";
+    public static string WebSearchUrl { get; set; } = DefaultSearchUrl;
+
+    // Limits that keep web results from flooding a small model's context
+    public const int MaxWebRequests = 3;    // per reply
+    public const int MaxWebRounds = 3;      // follow-up rounds, e.g. search then fetch a result
+    public const int WebMaxChars = 5000;    // per page
+
     public const string BackupDir = ".stoat-backups";
 
     public static readonly HashSet<string> Ignore = new(StringComparer.OrdinalIgnoreCase)
@@ -84,15 +116,6 @@ internal static class Config
         "node_modules", ".git", BackupDir, "dist", "build",
         ".next", "__pycache__", ".venv", "venv", ".env", ".stoat"
     };
-
-    // File content tags
-    public const string FileTag = "[FILENAME]";
-    public const string FileStartTag = "[START FILE CONTENTS]";
-    public const string FileEndTag = "[END FILE CONTENTS]";
-
-    // File list tags
-    public const string FileListStart = "[File List Start]";
-    public const string FileListEnd = "[File List End]";
 
     public const string StoatArt = """
 
@@ -147,6 +170,13 @@ internal static class Config
             OpenRouterApiKey = saved.OpenRouterApiKey;
             if (saved.PreferredModels != null)
                 PreferredModels = saved.PreferredModels;
+            WebMode = saved.WebMode;
+            if (saved.WebWhitelist != null)
+                WebWhitelist = saved.WebWhitelist;
+            if (saved.WebBlacklist != null)
+                WebBlacklist = saved.WebBlacklist;
+            if (!string.IsNullOrEmpty(saved.WebSearchUrl))
+                WebSearchUrl = saved.WebSearchUrl;
         }
         catch
         {
@@ -166,7 +196,11 @@ internal static class Config
                 Personality = DefaultPersonality,
                 Mode = CurrentMode,
                 OpenRouterApiKey = OpenRouterApiKey,
-                PreferredModels = PreferredModels
+                PreferredModels = PreferredModels,
+                WebMode = WebMode,
+                WebWhitelist = WebWhitelist,
+                WebBlacklist = WebBlacklist,
+                WebSearchUrl = WebSearchUrl == DefaultSearchUrl ? null : WebSearchUrl
             };
             var json = JsonSerializer.Serialize(saved, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(ConfigFilePath, json);

@@ -1,6 +1,7 @@
 using StoatTote;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 
 // Enable ANSI colors on Windows
 if (OperatingSystem.IsWindows())
@@ -129,6 +130,9 @@ else
     Config.Save();
 }
 
+await CheckVisionAsync();
+Console.WriteLine(Ansi.Dim($"  🌐 Web access: {Config.WebMode.ToString().ToLowerInvariant()} (type 'web' for settings)\n"));
+
 // Personality selection
 var personalities = StoatPersonalityManager.GetPersonalityNames();
 
@@ -168,6 +172,7 @@ Config.Save();
 Console.WriteLine(Ansi.Dim("  Type 'help' for commands, 'code' or 'chat' to switch modes.\n"));
 
 var chatHistory = new List<(string role, string content)>();
+var pendingImages = new List<ImageAttachment>();
 
 // Main loop
 while (true)
@@ -175,12 +180,13 @@ while (true)
     var modeIndicator = Config.CurrentMode == CliMode.Chat
         ? Ansi.Magenta("[CHAT] ")
         : Ansi.Green("[CODE] ");
+    var imageIndicator = pendingImages.Count > 0 ? Ansi.Yellow($"[📎 {pendingImages.Count}] ") : "";
 
-    Console.Write(Ansi.Cyan($"\n{modeIndicator}Stoat is awaiting your request: ") + Ansi.Dim("(type 'help' for commands)\n> "));
+    Console.Write(Ansi.Cyan($"\n{modeIndicator}") + imageIndicator + Ansi.Cyan("Stoat is awaiting your request: ") + Ansi.Dim("(type 'help' for commands)\n> "));
 
     var input = Console.ReadLine() ?? "";
 
-    var commandResult = HandleModeCommand(input, chatHistory);
+    var commandResult = HandleModeCommand(input, chatHistory, pendingImages);
     if (commandResult.shouldExit)
     {
         Console.WriteLine(Ansi.Yellow("\n  Stoat scurries away! 🐾\n"));
@@ -195,9 +201,9 @@ while (true)
     try
     {
         if (Config.CurrentMode == CliMode.Chat)
-            await RunChatModeAsync(input, chatHistory);
+            await RunChatModeAsync(input, chatHistory, pendingImages);
         else
-            await RunCodeModeAsync(input, chatHistory);
+            await RunCodeModeAsync(input, chatHistory, pendingImages);
     }
     catch (Exception ex)
     {
@@ -208,7 +214,7 @@ while (true)
 
 // === Helper Methods ===
 
-(bool shouldExit, bool switchedMode, bool wasHelp) HandleModeCommand(string input, List<(string role, string content)> history)
+(bool shouldExit, bool switchedMode, bool wasHelp) HandleModeCommand(string input, List<(string role, string content)> history, List<ImageAttachment> images)
 {
     var trimmed = input.Trim().ToLowerInvariant();
 
@@ -224,8 +230,36 @@ while (true)
         Console.WriteLine("    chat           " + Ansi.Dim("- Switch to Chat Mode"));
         Console.WriteLine("    server [name]  " + Ansi.Dim("- Switch server (ollama, llamacpp, openrouter)"));
         Console.WriteLine("    export         " + Ansi.Dim("- Export conversation as markdown file"));
+        Console.WriteLine("    image <path>   " + Ansi.Dim("- Attach an image to your next request"));
+        Console.WriteLine("    image          " + Ansi.Dim("- List attached images ('image clear' removes them)"));
+        Console.WriteLine("    web            " + Ansi.Dim("- Show web access settings"));
+        Console.WriteLine("    web <mode>     " + Ansi.Dim("- off, ask, whitelist, blacklist or full"));
+        Console.WriteLine("    web allow|block|remove <domain> " + Ansi.Dim("- Edit the whitelist/blacklist"));
+        Console.WriteLine("    web search <url> " + Ansi.Dim("- Search engine URL with {query}, or 'default'"));
         Console.WriteLine(Ansi.Dim("  (Or type your message to continue in current mode)\n"));
         return (false, false, true);
+    }
+
+    if (trimmed is "image" or "img" || trimmed.StartsWith("image ") || trimmed.StartsWith("img "))
+    {
+        // Use the original input so path casing survives; drag-and-drop paths arrive quoted
+        var raw = input.Trim();
+        var space = raw.IndexOf(' ');
+        var arg = space < 0 ? "" : raw.Substring(space + 1).Trim().Trim('"', '\'');
+
+        // "image processing in C#?" is a message, not a command
+        if (arg.Length == 0 || arg.Equals("clear", StringComparison.OrdinalIgnoreCase)
+            || ImageAttachment.IsImageFile(arg) || File.Exists(arg))
+        {
+            HandleImageCommand(arg, images);
+            return (false, false, true);
+        }
+    }
+
+    if (trimmed == "web" || trimmed.StartsWith("web "))
+    {
+        if (HandleWebCommand(input.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).Skip(1).ToArray()))
+            return (false, false, true);
     }
 
     if (trimmed == "export")
@@ -293,6 +327,7 @@ async Task SwitchServerAsync(string serverName, List<(string role, string conten
     }
 
     Config.CurrentServerName = serverName;
+    Config.ModelSupportsVision = null;
     Console.WriteLine(Ansi.Cyan($"\n  ↔ Switched to {Config.CurrentServer.Name} ({Config.CurrentServer.Url})\n"));
 
     if (Config.CurrentServer.Type == ServerType.OpenRouter && string.IsNullOrEmpty(Config.OpenRouterApiKey) && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("OPENROUTER_API_KEY")))
@@ -394,8 +429,155 @@ async Task SwitchServerAsync(string serverName, List<(string role, string conten
     }
 
     Config.Save();
+    await CheckVisionAsync();
     history.Add(("system", $"[Switched to {Config.CurrentServer.Name} server]"));
 }
+
+async Task CheckVisionAsync()
+{
+    Config.ModelSupportsVision = await LlmClient.SupportsVisionAsync();
+    var status = Config.ModelSupportsVision switch
+    {
+        true => Ansi.Green("yes"),
+        false => Ansi.Dim("no"),
+        null => Ansi.Yellow("unknown")
+    };
+    Console.WriteLine(Ansi.Dim("  👁  Image support: ") + status + "\n");
+}
+
+void HandleImageCommand(string arg, List<ImageAttachment> images)
+{
+    if (arg.Equals("clear", StringComparison.OrdinalIgnoreCase))
+    {
+        images.Clear();
+        Console.WriteLine(Ansi.Dim("\n  Cleared attached images.\n"));
+        return;
+    }
+
+    if (string.IsNullOrEmpty(arg))
+    {
+        if (images.Count == 0)
+        {
+            Console.WriteLine(Ansi.Dim("\n  No images attached. Usage: image <path>\n"));
+            return;
+        }
+
+        Console.WriteLine(Ansi.Bold($"\n  📎 {images.Count} image(s) attached to your next request:"));
+        foreach (var img in images)
+            Console.WriteLine($"    {img.Name} {Ansi.Dim($"({img.Base64.Length * 3 / 4 / 1024:N0} KB)")}");
+        Console.WriteLine();
+        return;
+    }
+
+    if (Config.ModelSupportsVision == false)
+    {
+        Console.WriteLine(Ansi.Yellow($"\n  ⚠ {Config.Model} doesn't support images. Switch to a vision model to attach them.\n"));
+        return;
+    }
+
+    try
+    {
+        var fullPath = Path.GetFullPath(arg);
+        images.Add(ImageAttachment.Load(fullPath, Path.GetFileName(fullPath)));
+        Console.WriteLine(Ansi.Green($"\n  ✓ Attached {Path.GetFileName(fullPath)}") + Ansi.Dim(" - it will be sent with your next request"));
+        if (Config.ModelSupportsVision == null)
+            Console.WriteLine(Ansi.Yellow($"  ⚠ Couldn't confirm {Config.Model} supports images - the server may reject it."));
+        Console.WriteLine();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine(Ansi.Red($"\n  ✗ {ex.Message}\n"));
+    }
+}
+
+/// <summary>
+/// Handles "web ..." commands. Returns false for input that isn't a web command,
+/// so "web development tips?" goes to the model as a message.
+/// </summary>
+bool HandleWebCommand(string[] args)
+{
+    if (args.Length == 0)
+    {
+        ShowWebSettings();
+        return true;
+    }
+
+    var sub = args[0].ToLowerInvariant();
+
+    if (args.Length == 1 && Enum.TryParse<WebMode>(sub, ignoreCase: true, out var mode) && !int.TryParse(sub, out _))
+    {
+        Config.WebMode = mode;
+        Config.Save();
+        Console.WriteLine(Ansi.Green($"\n  ✓ Web access: {mode.ToString().ToLowerInvariant()}\n"));
+        return true;
+    }
+
+    if (args.Length == 2 && sub is "allow" or "block" or "remove")
+    {
+        var domain = WebAccess.NormalizeDomain(args[1]);
+        if (!domain.Contains('.') && domain != "localhost")
+            return false;
+
+        if (sub == "allow")
+            WebAccess.AddDomain(Config.WebWhitelist, Config.WebBlacklist, domain);
+        else if (sub == "block")
+            WebAccess.AddDomain(Config.WebBlacklist, Config.WebWhitelist, domain);
+        else
+        {
+            Config.WebWhitelist.RemoveAll(d => d.Equals(domain, StringComparison.OrdinalIgnoreCase));
+            Config.WebBlacklist.RemoveAll(d => d.Equals(domain, StringComparison.OrdinalIgnoreCase));
+            Config.Save();
+        }
+
+        var verb = sub switch { "allow" => "whitelisted", "block" => "blacklisted", _ => "removed from both lists" };
+        Console.WriteLine(Ansi.Green($"\n  ✓ {domain} {verb}\n"));
+        return true;
+    }
+
+    if (args.Length == 2 && sub == "search" && (args[1].Contains("{query}") || args[1].Equals("default", StringComparison.OrdinalIgnoreCase)))
+    {
+        Config.WebSearchUrl = args[1].Equals("default", StringComparison.OrdinalIgnoreCase) ? Config.DefaultSearchUrl : args[1];
+        Config.Save();
+        Console.WriteLine(Ansi.Green($"\n  ✓ Search engine: {Config.WebSearchUrl}\n"));
+        return true;
+    }
+
+    return false;
+}
+
+void ShowWebSettings()
+{
+    var modeHelp = Config.WebMode switch
+    {
+        WebMode.Off => "the model can't use the web",
+        WebMode.Ask => "whitelist allowed, blacklist blocked, anything else asks you",
+        WebMode.Whitelist => "only whitelisted sites (plus the search engine)",
+        WebMode.Blacklist => "any site except blacklisted ones",
+        _ => "any site",
+    };
+    string List(List<string> domains) => domains.Count == 0 ? Ansi.Dim("(none)") : string.Join(", ", domains);
+
+    Console.WriteLine(Ansi.Bold("\n  🌐 Web access:"));
+    Console.WriteLine($"    Mode:      {Config.WebMode.ToString().ToLowerInvariant()} {Ansi.Dim($"- {modeHelp}")}");
+    Console.WriteLine($"    Whitelist: {List(Config.WebWhitelist)}");
+    Console.WriteLine($"    Blacklist: {List(Config.WebBlacklist)}");
+    Console.WriteLine($"    Search:    {Config.WebSearchUrl}");
+    Console.WriteLine(Ansi.Dim("  Change with: web <off|ask|whitelist|blacklist|full>, web allow|block|remove <domain>\n"));
+}
+
+/// <summary>Copies the attached images to send, dropping them if the model is known not to accept images.</summary>
+List<ImageAttachment> ImagesToSend(List<ImageAttachment> pending)
+{
+    if (pending.Count > 0 && Config.ModelSupportsVision == false)
+    {
+        Console.WriteLine(Ansi.Yellow($"  ⚠ {Config.Model} doesn't support images - dropping {pending.Count} attached image(s).\n"));
+        pending.Clear();
+    }
+    return pending.ToList();
+}
+
+string ImageNote(List<ImageAttachment> images) =>
+    images.Count > 0 ? $"\n\nAttached images: {string.Join(", ", images.Select(i => i.Name))}" : "";
 
 void ExportConversationAsMarkdown(List<(string role, string content)> history)
 {
@@ -441,23 +623,45 @@ void ExportConversationAsMarkdown(List<(string role, string content)> history)
     Console.WriteLine(Ansi.Green($"\n  ✓ Exported to {filename}\n"));
 }
 
-async Task RunChatModeAsync(string task, List<(string role, string content)> history)
+async Task RunChatModeAsync(string task, List<(string role, string content)> history, List<ImageAttachment> pendingImages)
 {
-    history.Add(("user", task));
+    var images = ImagesToSend(pendingImages);
+
+    // Later turns only carry the image names; the image itself is sent once
+    history.Add(("user", task + ImageNote(images)));
 
     var logFile = ConversationLogger.StartSession(task);
     Console.WriteLine(Ansi.Dim($"  📝 Logging to {logFile}\n"));
 
     var prompt = BuildChatPrompt(history);
+    var system = Config.CurrentPersonality.ChatSystem + WebAccess.PromptInstructions;
 
     Console.WriteLine(Ansi.Dim("\n  💬 Stoat:\n"));
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
 
-    var response = await LlmClient.GenerateStreamAsync(prompt, Config.CurrentPersonality.ChatSystem);
+    var response = await LlmClient.GenerateStreamAsync(prompt, system, images);
+
+    // The model may ask for searches or pages; run them and let it answer with the results
+    var lookups = new List<string>();
+    var done = new HashSet<WebRequest>();
+    for (int round = 0; round < Config.MaxWebRounds && Config.WebMode != WebMode.Off; round++)
+    {
+        var requests = Parser.ParseWebRequests(response).Where(done.Add).ToList();
+        if (requests.Count == 0) break;
+
+        var web = await WebAccess.RunAsync(requests);
+        lookups.Add(web.Summary);
+        prompt += $"{response}\n\nUser: {web.Text}\nUse these results to answer my last message.\nAssistant: ";
+
+        Console.WriteLine(Ansi.Dim("\n  💬 Stoat:\n"));
+        response = await LlmClient.GenerateStreamAsync(prompt, system, images);
+    }
+    pendingImages.Clear();
 
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
 
-    history.Add(("assistant", response));
+    // Later turns get a note of what was looked up, not the full page text
+    history.Add(("assistant", lookups.Count > 0 ? $"[Looked up: {string.Join("; ", lookups)}]\n{response}" : response));
     ConversationLogger.LogChatTurn(task, response);
 }
 
@@ -475,9 +679,10 @@ string BuildChatPrompt(List<(string role, string content)> history)
     return prompt.ToString();
 }
 
-async Task RunCodeModeAsync(string task, List<(string role, string content)> history)
+async Task RunCodeModeAsync(string task, List<(string role, string content)> history, List<ImageAttachment> pendingImages)
 {
     var cwd = Directory.GetCurrentDirectory();
+    var images = ImagesToSend(pendingImages);
 
     var logFile = ConversationLogger.StartSession(task);
     Console.WriteLine(Ansi.Dim($"  📝 Logging to {logFile}\n"));
@@ -485,12 +690,34 @@ async Task RunCodeModeAsync(string task, List<(string role, string content)> his
     // Phase 1: Send file tree, ask LLM which files it needs
 
     var tree = FileUtils.WalkDir(cwd);
-    var phase1Prompt = $"Task: {task.Trim()}\n\nProject files:\n{string.Join("\n", tree)}";
+    var phase1Prompt = $"Task: {task.Trim()}{ImageNote(images)}\n\nProject files:\n{string.Join("\n", tree)}";
+    var phase1System = Config.CurrentPersonality.Phase1System + WebAccess.PromptInstructions;
 
-    var phase1Response = await LlmClient.GenerateStreamAsync(phase1Prompt, Config.CurrentPersonality.Phase1System);
-    var fileList = Parser.ParseFileList(phase1Response);
+    var fileList = new List<string>();
+    var webResults = new StringBuilder();
+    var done = new HashSet<WebRequest>();
 
-    ConversationLogger.LogPhase1(phase1Prompt, phase1Response, fileList);
+    // The model may ask for web results before choosing files, e.g. search, then fetch a result.
+    // Web results go to Phase 2 as well, so no extra call is needed there.
+    for (int round = 1; ; round++)
+    {
+        var phase1Response = await LlmClient.GenerateStreamAsync(phase1Prompt, phase1System, images);
+        var roundFiles = Parser.ParseFileList(phase1Response, tree);
+        fileList = fileList.Union(roundFiles, StringComparer.OrdinalIgnoreCase).ToList();
+        ConversationLogger.LogPhase1(phase1Prompt, phase1Response, roundFiles);
+
+        var requests = Config.WebMode == WebMode.Off
+            ? new List<WebRequest>()
+            : Parser.ParseWebRequests(phase1Response).Where(done.Add).ToList();
+        if (requests.Count == 0) break;
+
+        var web = await WebAccess.RunAsync(requests);
+        webResults.Append(web.Text);
+        if (round >= Config.MaxWebRounds) break;
+
+        Console.WriteLine(Ansi.Dim("\n  🌐 Sending web results back to Stoat...\n"));
+        phase1Prompt += $"\n\n{web.Text}\nNow list the files you need. Add more SEARCH or FETCH lines only if you still need information.";
+    }
 
     if (fileList.Count == 0)
     {
@@ -521,16 +748,23 @@ async Task RunCodeModeAsync(string task, List<(string role, string content)> his
 
     // Phase 2: Pack files and get code changes
     Console.WriteLine(Ansi.Dim("\n  📦 Packing files..."));
-    var packed = PackFiles(task, fileList, cwd);
+    var (packed, phase2Images) = PackFiles(task, fileList, cwd, images, webResults.ToString());
 
     Console.WriteLine(Ansi.Cyan("\n  🐾 Stoat is working...\n"));
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
-    var response = await LlmClient.GenerateStreamAsync(packed, Config.CurrentPersonality.Phase2System);
+    var response = await LlmClient.GenerateStreamAsync(packed, Config.CurrentPersonality.Phase2System, phase2Images);
+    pendingImages.Clear();
     Console.WriteLine(Ansi.Dim(new string('─', 60)));
 
     FileBlock.SaveFileMD(response);
 
-    var blocks = Parser.ParseFileBlocks(response);
+    var blocks = Parser.ParseFileBlocks(response, fileList, tree);
+
+    // Models can look at images but can't write them - text would overwrite the image
+    var imageBlocks = blocks.RemoveAll(b => ImageAttachment.IsImageFile(b.FilePath));
+    if (imageBlocks > 0)
+        Console.WriteLine(Ansi.Yellow($"\n  ⚠ Ignored {imageBlocks} image file(s) in the reply - Stoat can't write images."));
+
     ConversationLogger.LogPhase2(packed, response, blocks);
 
     if (blocks.Count == 0)
@@ -559,12 +793,18 @@ async Task RunCodeModeAsync(string task, List<(string role, string content)> his
     foreach (var fb in blocks)
     {
         var fullPath = Path.Combine(cwd, fb.FilePath);
+
+        // Keep the file's existing line endings
+        var newline = Environment.NewLine;
+        if (File.Exists(fullPath))
+            newline = File.ReadAllText(fullPath).Contains("\r\n") ? "\r\n" : "\n";
+
         var backup = FileUtils.BackupFile(fullPath);
         if (backup != null)
             Console.WriteLine(Ansi.Dim($"    ↩ Backed up: {fb.FilePath}"));
 
         FileUtils.EnsureDir(Path.GetDirectoryName(fullPath)!);
-        File.WriteAllText(fullPath, fb.Content, Encoding.UTF8);
+        File.WriteAllText(fullPath, fb.Content.Replace("\n", newline), Encoding.UTF8);
         Console.WriteLine(Ansi.Green($"    ✓ Written: {fb.FilePath}"));
     }
 
@@ -587,31 +827,66 @@ void ShowCollectedFiles(List<string> files, string cwd)
         Console.WriteLine(Ansi.Dim($"    ... and {files.Count - 20} more"));
 }
 
-string PackFiles(string task, List<string> files, string cwd)
+/// <summary>Builds the Phase 2 prompt. Image files the model asked for are attached rather than skipped.</summary>
+(string prompt, List<ImageAttachment> images) PackFiles(string task, List<string> files, string cwd, List<ImageAttachment> attached, string webResults)
 {
+    var images = new List<ImageAttachment>(attached);
     var packed = new StringBuilder();
-    packed.AppendLine($"Task: {task.Trim()}");
+    packed.AppendLine($"Task: {task.Trim()}{ImageNote(attached)}");
     packed.AppendLine();
 
+    if (webResults.Length > 0)
+        packed.AppendLine(webResults);
+
+    // Files are shown in the same markdown shape the model should reply with
     foreach (var f in files)
     {
         var fullPath = Path.Combine(cwd, f);
+
+        if (ImageAttachment.IsImageFile(f) && File.Exists(fullPath))
+        {
+            if (Config.ModelSupportsVision == false)
+            {
+                packed.AppendLine($"{f} (image - this model can't view images)");
+            }
+            else
+            {
+                try
+                {
+                    images.Add(ImageAttachment.Load(fullPath, f));
+                    packed.AppendLine($"{f} (image attached)");
+                }
+                catch (Exception ex)
+                {
+                    packed.AppendLine($"{f} (image - skipped: {ex.Message})");
+                }
+            }
+            packed.AppendLine();
+            continue;
+        }
+
         var content = FileUtils.ReadFileContents(fullPath);
 
-        packed.Append(Config.FileTag);
-        packed.Append(f);
-        packed.Append(Config.FileTag);
-        packed.Append(Config.FileStartTag);
-        if (content != null)
-            packed.Append(content);
-        else if (!File.Exists(fullPath))
-            packed.Append("(new file)");
-        else
-            packed.Append("(binary - skipped)");
-        packed.Append(Config.FileEndTag);
+        if (content == null)
+        {
+            packed.AppendLine(File.Exists(fullPath) ? $"{f} (binary - skipped)" : $"{f} (new file - does not exist yet)");
+            packed.AppendLine();
+            continue;
+        }
+
+        // Use a fence longer than any backtick run in the file
+        var longestRun = Regex.Matches(content, "`+").Select(m => m.Length).DefaultIfEmpty(0).Max();
+        var fence = new string('`', Math.Max(3, longestRun + 1));
+
+        packed.AppendLine(f);
+        packed.AppendLine(fence + Path.GetExtension(f).TrimStart('.'));
+        packed.AppendLine(content.TrimEnd('\r', '\n'));
+        packed.AppendLine(fence);
+        packed.AppendLine();
     }
 
-    return packed.ToString();
+    packed.AppendLine("Reply with each file you change: its path on its own line, then the complete file in a code block.");
+    return (packed.ToString(), images);
 }
 
 // Windows ANSI support
